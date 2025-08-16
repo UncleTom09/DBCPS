@@ -1,0 +1,98 @@
+import yaml
+import tqdm
+import argparse
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from monai.transforms import *
+from config.experiment import prepare_experiment, update_config_file, makedirs
+from utils.iteration.load_data_v2 import TrainValDataPipeline
+from models.segmentation_models import SemiSupervisedContrastiveSegmentationModelA,
+from utils.iteration.iterator import set_random_seed
+from utils.ddp_utils import init_distributed_mode
+from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--task', type=str, default='la',
+                        help='experiment task, currently supports "pancreas"  "acdc" "BraTS2020" "la"')
+    parser.add_argument('--mixed', action="store_true",
+                        help='whether to use PyTorch native mixed precision training')
+    parser.add_argument('-pc', '--pretrain_ckpt', type=str, help='model checkpoint', required=True)
+    parser.add_argument('--benchmark', action="store_true",
+                        help='whether to use cudnn benchmark to speed up convolution operations')
+    parser.add_argument('--ncpu', type=int, default=8, help='number of workers for dataloader')
+    parser.add_argument('--verbose', action='store_true', help='print progress bar while training')
+    parser.add_argument('--exp_name', type=str, default='running', help='experiment name to save logs')
+    parser.add_argument("--world-size", default=1, type=int, help="number of distributed processes")
+    parser.add_argument("--dist-url", default="env://", type=str, help="url used to set up distributed training")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    ngpu = torch.cuda.device_count()
+    init_distributed_mode(args)
+    cfg_file = 'configs/{}.cfg'.format(args.task)
+    with open(cfg_file, 'r') as f:
+        cfg = yaml.safe_load(f)
+        print("successfully loaded config file: ", cfg)
+    cfg = update_config_file(args, cfg)
+    seed = cfg['TRAIN']['SEED']
+    ratio = cfg['TRAIN']['RATIO']
+
+    # define experiment name
+    full_exp_name = 'Inference_' + args.exp_name + '-task_{}-ratio_{}'.format(args.task, ratio)
+    cfg['EXP_NAME'] = full_exp_name
+
+    # set random seed for reproductivity
+    set_random_seed(seed=seed, benchmark=args.benchmark)
+
+    # define training & validation transforms
+    train_aug = Compose([
+        LoadImaged(keys=['image', 'label'], allow_missing_keys=True),
+        ToTensord(keys=['image', 'label'], allow_missing_keys=True),
+        NormalizeIntensityd(keys=['image'], allow_missing_keys=False),
+        EnsureTyped(keys=['image', 'label'], allow_missing_keys=True),
+        RandGridDistortiond(keys=['image', 'label'], allow_missing_keys=True, mode=['bilinear', 'nearest'],
+                            distort_limit=0.1, device=torch.device('cuda')),
+        RandSpatialCropd(keys=['image', 'label'], allow_missing_keys=True,
+                         roi_size=cfg['TRAIN']['PATCH_SIZE'], random_size=False),
+        ResizeWithPadOrCropd(keys=['image', 'label'], spatial_size=cfg['TRAIN']['PATCH_SIZE'],
+                             allow_missing_keys=True, mode='constant'),
+    ])
+
+    val_aug = Compose([
+        LoadImaged(keys=['image', 'label'], allow_missing_keys=True),
+        ToTensord(keys=['image', 'label'], allow_missing_keys=True),
+        NormalizeIntensityd(keys=['image'], allow_missing_keys=False),
+        EnsureTyped(keys=['image', 'label'], allow_missing_keys=True),
+    ])
+    save_root_path ='/root/autodl-tmp/DBCPS/DBCPS/experiments/Semiseg'
+    image_root, num_classes, class_names, affine = prepare_experiment(args.task)
+    save_dir, metric_savedir, infer_save_dir, vis_save_dir = makedirs(args.task, full_exp_name, save_root_path)
+    data_pipeline = TrainValDataPipeline(image_root,  label_ratio=ratio, random_seed=seed)
+    trainset, unlabeled_set, valset = data_pipeline.get_dataset(train_aug, val_aug, cache_dataset=False)
+    val_sampler = RandomSampler(valset)
+    val_loader = DataLoader(valset, batch_size=1, shuffle=False, sampler=val_sampler)
+    -- pretrain_ckpt = '/root/autodl-tmp/DBCPS/DBCPS/experiments/checkpoints/la/running-task_la-ratio_0.1/weights.pth'
+
+    # define models
+    model = SemiSupervisedContrastiveSegmentationModelA(cfg, num_classes=num_classes, amp=args.mixed)
+    model.load_networks_pth(pretrain_ckpt)
+    model.initialize_metric_meter(class_names)
+
+    # starts evaluation
+    print('Start evaluation, please wait...')
+    model.eval()
+    loader = tqdm.tqdm(val_loader) if args.verbose else val_loader
+    for step, batch_data in enumerate(loader):
+        model.set_test_input2(batch_data)
+        model.evaluate_one_step(True, infer_save_dir, affine, patch_based_inference=True)
+    model.metric_meter.report(print_stats=True)  # print stats
+    # save the metric at the end of training
+    model.metric_meter.save(metric_savedir, 'Evaluation_{}.csv'.format(full_exp_name))
+
+if __name__ == '__main__':
+    main()
+
