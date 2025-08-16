@@ -75,7 +75,7 @@ def main():
     trainset, unlabeled_set, valset = data_pipeline.get_dataset(train_aug, val_aug, cache_dataset=False)
     val_sampler = RandomSampler(valset)
     val_loader = DataLoader(valset, batch_size=1, shuffle=False, sampler=val_sampler)
-    -- pretrain_ckpt = '/root/autodl-tmp/DBCPS/DBCPS/experiments/checkpoints/la/running-task_la-ratio_0.1/weights.pth'
+    pretrain_ckpt = '/root/autodl-tmp/DBCPS/DBCPS/experiments/checkpoints/la/running-task_la-ratio_0.1/weights.pth'
 
     # define models
     model = SemiSupervisedContrastiveSegmentationModelA(cfg, num_classes=num_classes, amp=args.mixed)
